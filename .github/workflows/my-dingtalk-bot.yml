@@ -17,7 +17,6 @@ jobs:
           cat << 'PYEOF' > main.py
           import os, requests, json
 
-          # 计算RSI
           def rsi(prices):
               if len(prices) < 8: return 50
               gains = [max(prices[i]-prices[i-1], 0) for i in range(1, len(prices))]
@@ -26,7 +25,6 @@ jobs:
               avg_loss = sum(losses[-7:]) / 7
               return 100 - (100 / (1 + avg_gain/avg_loss)) if avg_loss > 0 else 100
 
-          # 计算EMA
           def ema(prices, period):
               if len(prices) < period: return prices[-1]
               k = 2 / (period + 1)
@@ -34,20 +32,15 @@ jobs:
               for p in prices[1:]: ema_val = p * k + ema_val * (1 - k)
               return ema_val
 
-          # 双重数据源获取函数
           def get_klines(symbol, coin_id):
-              # 眼睛1：币安API（主用，抓取最近24根1小时K线）
               try:
                   url = f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval=1h&limit=24"
                   data = requests.get(url, timeout=10).json()
                   if isinstance(data, list) and len(data) > 10:
-                      prices = [float(k[4]) for k in data] # 收盘价
-                      volumes = [float(k[5]) for k in data] # 成交量
+                      prices = [float(k[4]) for k in data]
+                      volumes = [float(k[5]) for k in data]
                       return prices, volumes
-              except Exception as e:
-                  pass
-
-              # 眼睛2：CoinGecko（备用，币安挂了就用它）
+              except: pass
               try:
                   url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
                   data = requests.get(url, timeout=10).json()
@@ -55,25 +48,23 @@ jobs:
                       prices = [p[1] for p in data['prices']]
                       volumes = [v[1] for v in data['total_volumes']]
                       return prices, volumes
-              except Exception as e:
-                  pass
+              except: pass
               return None, None
 
           webhook = os.environ.get('DINGTALK_WEBHOOK')
           ds_key = os.environ.get('DEEPSEEK_API_KEY')
-          is_manual = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
           
-          # 币种配置：(币安代号, CoinGecko ID, 显示名称)
+          # 修正这里的判断逻辑
+          is_manual = os.environ.get('IS_MANUAL') == 'true'
+          is_daily = os.environ.get('IS_DAILY') == 'true'
+
           coins = [('BTC', 'bitcoin', 'BTC'), ('ETH', 'ethereum', 'ETH'), ('SOL', 'solana', 'SOL'), ('BNB', 'binancecoin', 'BNB'), ('ZEC', 'zcash', 'ZEC'), ('DOGE', 'dogecoin', 'DOGE')]
           alerts = []
           market_data = []
 
           for symbol, coin_id, name in coins:
               prices, volumes = get_klines(symbol, coin_id)
-              if not prices:
-                  print(f"{name} 所有数据源都获取失败，跳过")
-                  continue
-              
+              if not prices: continue
               price = prices[-1]
               r = rsi(prices)
               e5 = ema(prices, 5)
@@ -83,24 +74,26 @@ jobs:
               change_1h = ((price - prices[-2]) / prices[-2]) * 100
               atr_pct = (sum(abs(prices[i]-prices[i-1]) for i in range(1, len(prices))) / len(prices)) / price * 100
 
-              if is_manual:
+              # 只有每日总结才收集全天数据
+              if is_daily:
+                  market_data.append({"币": name, "价": round(price,4), "24h": f"{((price-prices[0])/prices[0])*100:.2f}%", "RSI": round(r,2), "波": f"{atr_pct:.2f}%"})
+              else:
+                  # 狙击手（包含手动和每15分钟自动跑）
                   if r < 35 and change_1h > 0: alerts.append({"币": name, "向": "多", "价": round(price,4), "波": round(atr_pct,2), "由": "RSI超卖回升"})
                   elif r > 65 and change_1h < 0: alerts.append({"币": name, "向": "空", "价": round(price,4), "波": round(atr_pct,2), "由": "RSI超买回落"})
                   elif vol_ratio > 1.3 and change_1h > 0.5: alerts.append({"币": name, "向": "多", "价": round(price,4), "波": round(atr_pct,2), "由": "爆量急涨"})
                   elif vol_ratio > 1.3 and change_1h < -0.5: alerts.append({"币": name, "向": "空", "价": round(price,4), "波": round(atr_pct,2), "由": "爆量急跌"})
-              else:
-                  market_data.append({"币": name, "价": round(price,4), "24h": f"{((price-prices[0])/prices[0])*100:.2f}%", "RSI": round(r,2), "波": f"{atr_pct:.2f}%"})
 
-          if is_manual and alerts:
-              prompt = f"你是一名专业的高杠杆日内交易员。请基于以下数据给出操作建议：{json.dumps(alerts, ensure_ascii=False)}。要求：1.方向 2.杠杆固定10倍 3.开仓价（请基于当前价和波动率atr_pct，预测一个能碰到的挂单价格：低波动偏0.15%，中波动偏0.25%，高波动偏0.4%） 4.止损价（精准数字） 5.止盈区间（TP1和TP2，给区间不给单点） 6.失效条件。用Markdown输出。"
-              ds = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
-              requests.post(webhook, json={'msgtype': 'markdown', 'markdown': {'title': '⚡10倍日内挂单信号', 'text': '## ⚡ 10倍日内挂单信号\n\n' + ds.json()['choices'][0]['message']['content']}})
-              print("狙击信号已推送")
-          elif not is_manual and market_data:
+          if is_daily and market_data:
               prompt = f"你是一名专业的高杠杆日内交易员。今日行情数据：{json.dumps(market_data, ensure_ascii=False)}。请写一份今日行情总结，包含明天操作建议。如果行情平淡，建议空仓休息。用Markdown。"
               ds = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
               requests.post(webhook, json={'msgtype': 'markdown', 'markdown': {'title': '📊 每日行情总结', 'text': '## 📊 每日行情总结\n\n' + ds.json()['choices'][0]['message']['content']}})
               print("每日总结已推送")
+          elif alerts:
+              prompt = f"你是一名专业的高杠杆日内交易员。请基于以下数据给出操作建议：{json.dumps(alerts, ensure_ascii=False)}。要求：1.方向 2.杠杆固定10倍 3.开仓价（请预测一个能碰到的挂单价格：低波动偏0.15%，中波动偏0.25%，高波动偏0.4%） 4.止损价（精准数字） 5.止盈区间（TP1和TP2，给区间不给单点） 6.失效条件。用Markdown输出。"
+              ds = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
+              requests.post(webhook, json={'msgtype': 'markdown', 'markdown': {'title': '⚡10倍日内挂单信号', 'text': '## ⚡ 10倍日内挂单信号\n\n' + ds.json()['choices'][0]['message']['content']}})
+              print("狙击信号已推送")
           else:
               print("无信号，静默")
           PYEOF
@@ -108,3 +101,5 @@ jobs:
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          IS_DAILY: ${{ github.event.schedule == '59 15 * * *' }}
