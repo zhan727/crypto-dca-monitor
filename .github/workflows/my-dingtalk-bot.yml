@@ -11,17 +11,19 @@ jobs:
     steps:
       - name: Analyze and Push
         run: |
-          curl -s "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true" > market.json
-          BTC_PRICE=$(jq -r '.bitcoin.usd' market.json)
-          ETH_PRICE=$(jq -r '.ethereum.usd' market.json)
+          curl -s "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,binancecoin,zcash,dogecoin&vs_currencies=usd&include_24hr_change=true" > market.json
+          MARKET_DATA=$(cat market.json | jq -c .)
+          PROMPT="以下是加密货币实时数据：$MARKET_DATA。请分析当前市场是做多还是做空，并给出理由。"
+          JSON_PAYLOAD=$(jq -n --arg prompt "$PROMPT" '{model: "deepseek-chat", messages: [{role: "user", content: $prompt}]}')
           curl -s -X POST https://api.deepseek.com/v1/chat/completions \
             -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "以下是加密货币实时数据：BTC价格为 '$BTC_PRICE'，ETH价格为 '$ETH_PRICE'。请分析当前市场是做多还是做空，并给出理由。"}]}' > analysis.json
+            -d "$JSON_PAYLOAD" > analysis.json
           ANALYSIS=$(jq -r '.choices[0].message.content' analysis.json)
+          MSG_PAYLOAD=$(jq -n --arg text "$ANALYSIS" '{msgtype: "markdown", markdown: {title: "币圈AI分析", text: $text}}')
           curl -s -X POST $DINGTALK_WEBHOOK \
             -H "Content-Type: application/json" \
-            -d '{"msgtype": "markdown", "markdown": {"title": "币圈AI分析", "text": "'"$ANALYSIS"'"}}'
+            -d "$MSG_PAYLOAD"
         env:
           TICKDB_API_KEY: ${{ secrets.TICKDB_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
