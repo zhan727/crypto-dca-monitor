@@ -18,6 +18,7 @@ jobs:
           import os, requests, json
 
           def rsi(prices):
+              if len(prices) < 8: return 50
               gains = [max(prices[i]-prices[i-1], 0) for i in range(1, len(prices))]
               losses = [max(prices[i-1]-prices[i], 0) for i in range(1, len(prices))]
               avg_gain = sum(gains[-7:]) / 7
@@ -25,6 +26,7 @@ jobs:
               return 100 - (100 / (1 + avg_gain/avg_loss)) if avg_loss > 0 else 100
 
           def ema(prices, period):
+              if len(prices) < period: return prices[-1]
               k = 2 / (period + 1)
               ema_val = prices[0]
               for p in prices[1:]: ema_val = p * k + ema_val * (1 - k)
@@ -33,35 +35,40 @@ jobs:
           webhook = os.environ.get('DINGTALK_WEBHOOK')
           ds_key = os.environ.get('DEEPSEEK_API_KEY')
           is_manual = os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-
           coins = [('bitcoin', 'BTC'), ('ethereum', 'ETH'), ('solana', 'SOL'), ('binancecoin', 'BNB'), ('zcash', 'ZEC'), ('dogecoin', 'DOGE')]
           alerts = []
           market_data = []
 
           for coin_id, symbol in coins:
-              url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
-              data = requests.get(url).json()
-              prices = [p[1] for p in data['prices']]
-              volumes = [v[1] for v in data['total_volumes']]
-              price = prices[-1]
-              r = rsi(prices)
-              e5 = ema(prices, 5)
-              e13 = ema(prices, 13)
-              vol_avg = sum(volumes[-24:-1]) / max(len(volumes[-24:-1]), 1)
-              vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1
-              change_1h = ((price - prices[-2]) / prices[-2]) * 100
-              atr_pct = (sum(abs(prices[i]-prices[i-1]) for i in range(1, len(prices))) / len(prices)) / price * 100
-              
-              if is_manual:
-                  if r < 35 and change_1h > 0: alerts.append({"币": symbol, "向": "多", "价": round(price,4), "波": round(atr_pct,2), "由": "RSI超卖回升+爆量"})
-                  elif r > 65 and change_1h < 0: alerts.append({"币": symbol, "向": "空", "价": round(price,4), "波": round(atr_pct,2), "由": "RSI超买回落+爆量"})
-                  elif vol_ratio > 1.3 and change_1h > 0.5: alerts.append({"币": symbol, "向": "多", "价": round(price,4), "波": round(atr_pct,2), "由": "爆量急涨"})
-                  elif vol_ratio > 1.3 and change_1h < -0.5: alerts.append({"币": symbol, "向": "空", "价": round(price,4), "波": round(atr_pct,2), "由": "爆量急跌"})
-              else:
-                  market_data.append({"币": symbol, "价": round(price,4), "24h": f"{((price-prices[0])/prices[0])*100:.2f}%", "RSI": round(r,2), "波": f"{atr_pct:.2f}%"})
+              try:
+                  url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+                  data = requests.get(url).json()
+                  if 'prices' not in data or len(data['prices']) < 30:
+                      print(f"{symbol} 数据获取失败，跳过")
+                      continue
+                  prices = [p[1] for p in data['prices']]
+                  volumes = [v[1] for v in data['total_volumes']]
+                  price = prices[-1]
+                  r = rsi(prices)
+                  e5 = ema(prices, 5)
+                  e13 = ema(prices, 13)
+                  vol_avg = sum(volumes[-24:-1]) / max(len(volumes[-24:-1]), 1)
+                  vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1
+                  change_1h = ((price - prices[-2]) / prices[-2]) * 100
+                  atr_pct = (sum(abs(prices[i]-prices[i-1]) for i in range(1, len(prices))) / len(prices)) / price * 100
+                  
+                  if is_manual:
+                      if r < 35 and change_1h > 0: alerts.append({"币": symbol, "向": "多", "价": round(price,4), "波": round(atr_pct,2), "由": "RSI超卖回升"})
+                      elif r > 65 and change_1h < 0: alerts.append({"币": symbol, "向": "空", "价": round(price,4), "波": round(atr_pct,2), "由": "RSI超买回落"})
+                      elif vol_ratio > 1.3 and change_1h > 0.5: alerts.append({"币": symbol, "向": "多", "价": round(price,4), "波": round(atr_pct,2), "由": "爆量急涨"})
+                      elif vol_ratio > 1.3 and change_1h < -0.5: alerts.append({"币": symbol, "向": "空", "价": round(price,4), "波": round(atr_pct,2), "由": "爆量急跌"})
+                  else:
+                      market_data.append({"币": symbol, "价": round(price,4), "24h": f"{((price-prices[0])/prices[0])*100:.2f}%", "RSI": round(r,2), "波": f"{atr_pct:.2f}%"})
+              except Exception as e:
+                  print(f"{symbol} 异常: {e}")
 
           if is_manual and alerts:
-              prompt = f"你是一名专业的高杠杆日内交易员。请基于以下数据给出操作建议：{json.dumps(alerts, ensure_ascii=False)}。要求：1.方向 2.杠杆固定10倍 3.开仓价（请预测一个比当前价偏移0.15%-0.4%的挂单价格，根据波动率决定，要能碰到的） 4.止损价（精准数字） 5.止盈区间（TP1和TP2，给区间不给单点） 6.失效条件。用Markdown输出。"
+              prompt = f"你是一名专业的高杠杆日内交易员。请基于以下数据给出操作建议：{json.dumps(alerts, ensure_ascii=False)}。要求：1.方向 2.杠杆固定10倍 3.开仓价（请基于当前价和波动率atr_pct，预测一个能碰到的挂单价格：低波动偏0.15%，中波动偏0.25%，高波动偏0.4%） 4.止损价（精准数字） 5.止盈区间（TP1和TP2，给区间不给单点） 6.失效条件。用Markdown输出。"
               ds = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
               requests.post(webhook, json={'msgtype': 'markdown', 'markdown': {'title': '⚡10倍日内挂单信号', 'text': '## ⚡ 10倍日内挂单信号\n\n' + ds.json()['choices'][0]['message']['content']}})
               print("狙击信号已推送")
