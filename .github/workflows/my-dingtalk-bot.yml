@@ -2,28 +2,127 @@ name: AI Crypto DingTalk Bot
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - name: Analyze and Push
+      - name: Install dependencies
+        run: pip install requests
+      - name: Professional Signal Hunter
         run: |
-          curl -s "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,binancecoin,zcash,dogecoin&vs_currencies=usd&include_24hr_change=true" > market.json
-          MARKET_DATA=$(cat market.json | jq -c .)
-          PROMPT="以下是加密货币实时数据：$MARKET_DATA。请分析当前市场是做多还是做空，并给出理由。"
-          JSON_PAYLOAD=$(jq -n --arg prompt "$PROMPT" '{model: "deepseek-chat", messages: [{role: "user", content: $prompt}]}')
-          curl -s -X POST https://api.deepseek.com/v1/chat/completions \
-            -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD" > analysis.json
-          ANALYSIS=$(jq -r '.choices[0].message.content' analysis.json)
-          MSG_PAYLOAD=$(jq -n --arg text "$ANALYSIS" '{msgtype: "markdown", markdown: {title: "币圈AI分析", text: $text}}')
-          curl -s -X POST $DINGTALK_WEBHOOK \
-            -H "Content-Type: application/json" \
-            -d "$MSG_PAYLOAD"
+          cat << 'PYEOF' > hunter.py
+          import os, requests, json
+
+          def rsi(prices, period=14):
+              if len(prices) < period + 1: return 50
+              gains, losses = [], []
+              for i in range(1, len(prices)):
+                  diff = prices[i] - prices[i-1]
+                  gains.append(max(diff, 0))
+                  losses.append(max(-diff, 0))
+              avg_gain = sum(gains[-period:]) / period
+              avg_loss = sum(losses[-period:]) / period
+              if avg_loss == 0: return 100
+              return 100 - (100 / (1 + avg_gain / avg_loss))
+
+          def ema_series(prices, period):
+              k = 2 / (period + 1)
+              result = [prices[0]]
+              for p in prices[1:]:
+                  result.append(p * k + result[-1] * (1 - k))
+              return result
+
+          def macd(prices):
+              e12 = ema_series(prices, 12)
+              e26 = ema_series(prices, 26)
+              macd_line = [e12[i] - e26[i] for i in range(len(e12))]
+              signal_line = ema_series(macd_line, 9)
+              return macd_line, signal_line
+
+          def bollinger(prices, period=20):
+              if len(prices) < period: return None, None, None
+              recent = prices[-period:]
+              ma = sum(recent) / period
+              variance = sum((p - ma) ** 2 for p in recent) / period
+              std = variance ** 0.5
+              return ma + 2 * std, ma, ma - 2 * std
+
+          def analyze(prices, volumes):
+              if len(prices) < 30: return 0, 0, {}
+              r = rsi(prices)
+              r_prev = rsi(prices[:-1])
+              price = prices[-1]
+              e9_series = ema_series(prices, 9)
+              e21_series = ema_series(prices, 21)
+              e9, e21 = e9_series[-1], e21_series[-1]
+              e9_prev, e21_prev = e9_series[-2], e21_series[-2]
+              macd_line, signal_line = macd(prices)
+              macd_now, sig_now = macd_line[-1], signal_line[-1]
+              macd_prev, sig_prev = macd_line[-2], signal_line[-2]
+              bb_upper, bb_mid, bb_lower = bollinger(prices)
+              vol_avg = sum(volumes[-24:-1]) / max(len(volumes[-24:-1]), 1)
+              vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1
+              change_1h = ((price - prices[-2]) / prices[-2]) * 100
+              bull, bear = 0, 0
+              bull_msg, bear_msg = [], []
+              if r_prev < 35 and r > r_prev:
+                  bull += 25; bull_msg.append(f"RSI超卖回升({r_prev:.0f}->{r:.0f})")
+              if r_prev > 65 and r < r_prev:
+                  bear += 25; bear_msg.append(f"RSI超买回落({r_prev:.0f}->{r:.0f})")
+              if macd_prev <= sig_prev and macd_now > sig_now:
+                  bull += 20; bull_msg.append("MACD金叉")
+              if macd_prev >= sig_prev and macd_now < sig_now:
+                  bear += 20; bear_msg.append("MACD死叉")
+              if e9_prev <= e21_prev and e9 > e21:
+                  bull += 15; bull_msg.append("EMA金叉")
+              if e9_prev >= e21_prev and e9 < e21:
+                  bear += 15; bear_msg.append("EMA死叉")
+              if bb_lower and price < bb_lower:
+                  bull += 15; bull_msg.append("触及布林下轨")
+              if bb_upper and price > bb_upper:
+                  bear += 15; bear_msg.append("触及布林上轨")
+              if vol_ratio > 1.4 and change_1h > 0.5:
+                  bull += 15; bull_msg.append(f"放量上涨(量比{vol_ratio:.1f})")
+              if vol_ratio > 1.4 and change_1h < -0.5:
+                  bear += 15; bear_msg.append(f"放量下跌(量比{vol_ratio:.1f})")
+              return bull, bear, {"rsi": round(r,2), "price": round(price,4), "vol_ratio": round(vol_ratio,2), "change_1h": round(change_1h,2), "bull_msg": bull_msg, "bear_msg": bear_msg}
+
+          coins = ['bitcoin', 'ethereum', 'solana', 'binancecoin', 'zcash', 'dogecoin']
+          alerts = []
+          for coin in coins:
+              try:
+                  url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=2"
+                  data = requests.get(url).json()
+                  prices = [p[1] for p in data['prices']]
+                  volumes = [v[1] for v in data['total_volumes']]
+                  bull_1h, bear_1h, info_1h = analyze(prices[-48:], volumes[-48:])
+                  bull_4h, bear_4h, info_4h = analyze(prices[::4], volumes[::4])
+                  if bull_1h >= 40 and bull_4h >= 40:
+                      bull_1h += 15; info_1h["bull_msg"].append("1H+4H同向看多")
+                  elif bear_1h >= 40 and bear_4h >= 40:
+                      bear_1h += 15; info_1h["bear_msg"].append("1H+4H同向看空")
+                  if bull_1h >= 75:
+                      alerts.append({"coin": coin, "direction": "看多", "score": bull_1h, "price": info_1h["price"], "signals": info_1h["bull_msg"]})
+                  elif bear_1h >= 75:
+                      alerts.append({"coin": coin, "direction": "看空", "score": bear_1h, "price": info_1h["price"], "signals": info_1h["bear_msg"]})
+              except Exception as e:
+                  print(f"{coin} error: {e}")
+
+          if alerts:
+              ds_key = os.environ.get('DEEPSEEK_API_KEY')
+              prompt = "你是一名专业交易员。以下是高共振信号：" + json.dumps(alerts, ensure_ascii=False) + "。请给出操作建议（入场、止损、止盈）和风险提示，用Markdown输出。"
+              ds_resp = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
+              analysis = ds_resp.json()['choices'][0]['message']['content']
+              webhook = os.environ.get('DINGTALK_WEBHOOK')
+              msg = {'msgtype': 'markdown', 'markdown': {'title': '猎手信号', 'text': '## 🎯 高共振信号\n\n' + analysis}}
+              requests.post(webhook, json=msg)
+          else:
+              print("无高置信度信号，静默")
+          PYEOF
+          python3 hunter.py
         env:
           TICKDB_API_KEY: ${{ secrets.TICKDB_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
