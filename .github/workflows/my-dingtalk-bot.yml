@@ -2,7 +2,8 @@ name: AI Crypto DingTalk Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/15 * * * *' # 每15分钟自动执行一次短线刺客
+    - cron: '59 15 * * *'  # 北京时间晚上23:59自动发每日总结
   workflow_dispatch:
 
 jobs:
@@ -11,9 +12,10 @@ jobs:
     steps:
       - name: Install dependencies
         run: pip install requests
-      - name: High Leverage Intraday Hunter
+
+      - name: Generate Scripts
         run: |
-          cat << 'PYEOF' > hunter.py
+          cat << 'PYEOF' > sniper.py
           import os, requests, json
 
           def rsi(prices, period=7):
@@ -50,13 +52,6 @@ jobs:
               std = variance ** 0.5
               return ma + 2 * std, ma, ma - 2 * std
 
-          def atr(prices, period=14):
-              if len(prices) < period + 1: return 0
-              trs = []
-              for i in range(1, len(prices)):
-                  trs.append(abs(prices[i] - prices[i-1]))
-              return sum(trs[-period:]) / period
-
           def analyze(prices, volumes):
               if len(prices) < 30: return 0, 0, {}
               r = rsi(prices)
@@ -70,35 +65,24 @@ jobs:
               macd_now, sig_now = macd_line[-1], signal_line[-1]
               macd_prev, sig_prev = macd_line[-2], signal_line[-2]
               bb_upper, bb_mid, bb_lower = bollinger(prices)
-              atr_val = atr(prices)
-              atr_pct = (atr_val / price) * 100 if price > 0 else 1
               vol_avg = sum(volumes[-24:-1]) / max(len(volumes[-24:-1]), 1)
               vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1
               change_1h = ((price - prices[-2]) / prices[-2]) * 100
               bull, bear = 0, 0
               bull_msg, bear_msg = [], []
               
-              if r_prev < 30 and r > r_prev:
-                  bull += 30; bull_msg.append(f"RSI极超卖回升({r_prev:.0f}->{r:.0f})")
-              if r_prev > 70 and r < r_prev:
-                  bear += 30; bear_msg.append(f"RSI极超买回落({r_prev:.0f}->{r:.0f})")
-              if e5_prev <= e13_prev and e5 > e13:
-                  bull += 25; bull_msg.append("EMA5上穿EMA13(金叉)")
-              if e5_prev >= e13_prev and e5 < e13:
-                  bear += 25; bear_msg.append("EMA5下穿EMA13(死叉)")
-              if vol_ratio > 1.5 and change_1h > 0.8:
-                  bull += 25; bull_msg.append(f"日内爆量急涨(量比{vol_ratio:.1f})")
-              if vol_ratio > 1.5 and change_1h < -0.8:
-                  bear += 25; bear_msg.append(f"日内爆量急跌(量比{vol_ratio:.1f})")
-              if macd_prev <= sig_prev and macd_now > sig_now:
-                  bull += 10; bull_msg.append("MACD金叉")
-              if macd_prev >= sig_prev and macd_now < sig_now:
-                  bear += 10; bear_msg.append("MACD死叉")
-              if bb_lower and price < bb_lower:
-                  bull += 10; bull_msg.append("触及布林下轨")
-              if bb_upper and price > bb_upper:
-                  bear += 10; bear_msg.append("触及布林上轨")
-              return bull, bear, {"rsi": round(r,2), "price": round(price,4), "vol_ratio": round(vol_ratio,2), "change_1h": round(change_1h,2), "atr_pct": round(atr_pct,2), "bull_msg": bull_msg, "bear_msg": bear_msg}
+              # 灵敏度提升：RSI 放宽到 35/65，成交量降到 1.3，波动降到 0.5%
+              if r_prev < 35 and r > r_prev: bull += 30; bull_msg.append(f"RSI超卖回升({r_prev:.0f}->{r:.0f})")
+              if r_prev > 65 and r < r_prev: bear += 30; bear_msg.append(f"RSI超买回落({r_prev:.0f}->{r:.0f})")
+              if e5_prev <= e13_prev and e5 > e13: bull += 25; bull_msg.append("EMA5上穿EMA13")
+              if e5_prev >= e13_prev and e5 < e13: bear += 25; bear_msg.append("EMA5下穿EMA13")
+              if vol_ratio > 1.3 and change_1h > 0.5: bull += 25; bull_msg.append(f"爆量上涨(量比{vol_ratio:.1f})")
+              if vol_ratio > 1.3 and change_1h < -0.5: bear += 25; bear_msg.append(f"爆量下跌(量比{vol_ratio:.1f})")
+              if macd_prev <= sig_prev and macd_now > sig_now: bull += 10; bull_msg.append("MACD金叉")
+              if macd_prev >= sig_prev and macd_now < sig_now: bear += 10; bear_msg.append("MACD死叉")
+              if bb_lower and price < bb_lower: bull += 10; bull_msg.append("触及布林下轨")
+              if bb_upper and price > bb_upper: bear += 10; bear_msg.append("触及布林上轨")
+              return bull, bear, {"rsi": round(r,2), "price": round(price,4), "vol_ratio": round(vol_ratio,2), "change_1h": round(change_1h,2), "bull_msg": bull_msg, "bear_msg": bear_msg}
 
           coins = ['bitcoin', 'ethereum', 'solana', 'binancecoin', 'zcash', 'dogecoin']
           alerts = []
@@ -109,26 +93,68 @@ jobs:
                   prices = [p[1] for p in data['prices']]
                   volumes = [v[1] for v in data['total_volumes']]
                   bull_1h, bear_1h, info_1h = analyze(prices, volumes)
-                  if bull_1h >= 60:
-                      alerts.append({"coin": coin, "direction": "看多", "score": bull_1h, "price": info_1h["price"], "atr_pct": info_1h["atr_pct"], "signals": info_1h["bull_msg"]})
-                  elif bear_1h >= 60:
-                      alerts.append({"coin": coin, "direction": "看空", "score": bear_1h, "price": info_1h["price"], "atr_pct": info_1h["atr_pct"], "signals": info_1h["bear_msg"]})
-              except Exception as e:
-                  print(f"{coin} error: {e}")
+                  # 门槛降为 45 分
+                  if bull_1h >= 45: alerts.append({"coin": coin, "direction": "看多", "score": bull_1h, "price": info_1h["price"], "signals": info_1h["bull_msg"]})
+                  elif bear_1h >= 45: alerts.append({"coin": coin, "direction": "看空", "score": bear_1h, "price": info_1h["price"], "signals": info_1h["bear_msg"]})
+              except Exception as e: pass
 
           if alerts:
               ds_key = os.environ.get('DEEPSEEK_API_KEY')
-              prompt = f"你是一名专业的高杠杆日内交易员。以下是短线（15分钟-1小时级别）的指标数据：{json.dumps(alerts, ensure_ascii=False)}。请针对每个币种，用 Markdown 输出：1.交易方向（做多/做空/观望）2.建议杠杆（5x-20x，波动越大杠杆越低）3.开仓价 4.止损价（必须紧凑）5.止盈价（TP1和TP2）6.核心逻辑。警告：如果行情不够剧烈，直接建议观望。"
+              prompt = f"你是一名专业的高杠杆日内交易员。以下是短线（15分钟-1小时级别）指标数据：{json.dumps(alerts, ensure_ascii=False)}。请针对每个币种，用Markdown输出：1.交易方向(做多/做空) 2.建议杠杆(5x-20x) 3.开仓价 4.止损价(必须紧凑) 5.止盈价(TP1和TP2) 6.核心逻辑。注意：这是日内短线，快进快出。"
               ds_resp = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
               analysis = ds_resp.json()['choices'][0]['message']['content']
-              webhook = os.environ.get('DINGTALK_WEBHOOK')
-              msg = {'msgtype': 'markdown', 'markdown': {'title': '⚡高杠杆日内信号', 'text': '## ⚡ 高杠杆日内信号\n\n' + analysis}}
-              requests.post(webhook, json=msg)
+              requests.post(os.environ.get('DINGTALK_WEBHOOK'), json={'msgtype': 'markdown', 'markdown': {'title': '⚡短线刺客信号', 'text': '## ⚡ 短线刺客信号\n\n' + analysis}})
           else:
               print("无高置信度短线信号，静默")
           PYEOF
-          python3 hunter.py
+
+          cat << 'PYEOF' > summary.py
+          import os, requests, json
+
+          def get_coin_data(coin_id):
+              try:
+                  url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+                  data = requests.get(url).json()
+                  prices = [p[1] for p in data['prices']]
+                  if len(prices) < 30: return None
+                  price = prices[-1]
+                  change_24h = ((price - prices[0]) / prices[0]) * 100
+                  gains = [max(prices[i]-prices[i-1], 0) for i in range(1, len(prices))]
+                  losses = [max(prices[i-1]-prices[i], 0) for i in range(1, len(prices))]
+                  avg_gain = sum(gains[-7:]) / 7
+                  avg_loss = sum(losses[-7:]) / 7
+                  rsi_val = 100 - (100 / (1 + avg_gain/avg_loss)) if avg_loss > 0 else 100
+                  atr_pct = (sum(abs(prices[i]-prices[i-1]) for i in range(1, len(prices))) / len(prices)) / price * 100
+                  return {"price": round(price, 4), "change_24h": round(change_24h, 2), "rsi": round(rsi_val, 2), "atr_pct": round(atr_pct, 2)}
+              except: return None
+
+          coins = [('bitcoin', 'BTC'), ('ethereum', 'ETH'), ('solana', 'SOL'), ('binancecoin', 'BNB'), ('zcash', 'ZEC'), ('dogecoin', 'DOGE')]
+          market_data = []
+          for coin_id, symbol in coins:
+              data = get_coin_data(coin_id)
+              if data:
+                  market_data.append({"币种": symbol, "价格": data["price"], "24小时涨跌幅": f"{data['change_24h']}%", "RSI": data["rsi"], "波动率": f"{data['atr_pct']}%"})
+          
+          if market_data:
+              ds_key = os.environ.get('DEEPSEEK_API_KEY')
+              prompt = f"这是今天加密货币市场的总结数据：{json.dumps(market_data, ensure_ascii=False)}。请你扮演专业的高杠杆日内交易员，写一份今日市场总结报告。要求：1.总结今天整体行情。2.点评异常波动。3.给出明天短线操作建议。4.如果今天没什么信号，明确告诉用户'今天行情平淡，建议空仓休息'。5.用Markdown输出。"
+              ds_resp = requests.post('https://api.deepseek.com/v1/chat/completions', headers={'Authorization': f'Bearer {ds_key}', 'Content-Type': 'application/json'}, json={'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': prompt}]})
+              analysis = ds_resp.json()['choices'][0]['message']['content']
+              requests.post(os.environ.get('DINGTALK_WEBHOOK'), json={'msgtype': 'markdown', 'markdown': {'title': '📊 每日行情总结', 'text': '## 📊 每日行情总结\n\n' + analysis}})
+          else:
+              print("今日数据获取失败，静默")
+          PYEOF
+
+      - name: Run Sniper
+        if: github.event.schedule == '*/15 * * * *'
+        run: python3 sniper.py
         env:
-          TICKDB_API_KEY: ${{ secrets.TICKDB_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+
+      - name: Run Daily Summary
+        if: github.event.schedule == '59 15 * * *' || github.event_name == 'workflow_dispatch'
+        run: python3 summary.py
+        env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
