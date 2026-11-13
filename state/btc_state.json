@@ -1,12 +1,12 @@
 {
   "armed": {
-    "T1": true,
+    "T1": false,
     "T2": true,
     "T3": true,
     "T4": true
   },
-  "last_check_utc": "2026-11-12T18:08:12.737182+00:00",
-  "last_price": 71812.305,
+  "last_check_utc": "2026-11-13T00:59:26.395882+00:00",
+  "last_price": 71002.985,
   "last_ref": 79500.0,
-  "tier": "WATCH"
+  "tier": "T1"
 }
